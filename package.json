@@ -1,0 +1,14 @@
+{
+  "name": "axton-obsidian-visual-skills",
+  "version": "1.2.1",
+  "description": "Obsidian visual skills for Pi: Excalidraw diagrams, Mermaid visualizer, Canvas creator",
+  "keywords": ["pi-package"],
+  "license": "MIT",
+  "pi": {
+    "skills": [
+      "./excalidraw-diagram",
+      "./mermaid-visualizer",
+      "./obsidian-canvas-creator"
+    ]
+  }
+}
