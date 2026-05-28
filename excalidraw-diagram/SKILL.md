@@ -32,11 +32,13 @@ SKILL_DIR = excalidraw-diagram skill 所在目录
 
 ### 工作目录
 
-进入评价流程时，先创建带时间戳的工作目录，所有中间文件统一放这里：
+进入评价流程时，先创建带时间戳的工作目录，所有中间文件统一放这里。**一次 skill 调用只创建一次，后续所有步骤共用同一目录**。
 
 ```bash
+# 步骤 0：创建一次，后续复用
 WORK_DIR="/tmp/excalidraw-$(date +%Y%m%d-%H%M%S)"
 mkdir -p "$WORK_DIR"
+echo "$WORK_DIR"  # 记住这个路径，后续步骤都用它
 ```
 
 后续所有路径均基于 `$WORK_DIR`，例如：
