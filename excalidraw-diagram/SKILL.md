@@ -2,12 +2,168 @@
 name: excalidraw-diagram
 description: Generate Excalidraw diagrams from text content. Supports three output modes - Obsidian (.md), Standard (.excalidraw), and Animated (.excalidraw with animation order). Triggers on "Excalidraw", "画图", "流程图", "思维导图", "可视化", "diagram", "标准Excalidraw", "standard excalidraw", "Excalidraw动画", "动画图", "animate".
 metadata:
-  version: 1.2.1
+  version: 2.0.0
 ---
 
 # Excalidraw Diagram Generator
 
 Create Excalidraw diagrams from text content with multiple output formats.
+
+## Subagent 执行模式
+
+**重要：本 skill 采用多步骤流程，生成 → 转图片 → 视觉评价 → 调整优化。**
+
+> ⚠️ **不是每次都要走评价流程**：只有在用户明确要求**评价**、**优化排版/布局/样式**、或者**已有文件需要优化**时，才走步骤 2-5 的评价调整循环。如果用户只是要求**生成图表**，直接步骤 1 生成 → 步骤 6 保存到目标路径即可。
+
+> ⚠️ **父 agent 不要读取图片文件**，图片只由 excalidraw-reviewer subagent 读取，避免浪费 token。
+
+> ⚠️ **避免递归嵌套**：不要在 subagent 调用中使用 `skill: ["excalidraw-diagram"]`，否则 worker 也会尝试再套一层 subagent 导致无限嵌套。改为在 task 中直接写明所有规范。
+
+### 脚本路径
+
+所有辅助脚本位于本 skill 目录下：
+
+```
+SKILL_DIR = excalidraw-diagram skill 所在目录
+{SKILL_DIR}/flowchart-to-excalidraw.js   # .md → .excalidraw
+{SKILL_DIR}/excalidraw-screenshot.js     # .excalidraw → .png
+```
+
+### 完整流程
+
+```
+步骤 1: 生成初始图表
+  ↓ 通过 subagent（delegate + mimo-v2.5）生成 Excalidraw JSON → 保存到 /tmp
+步骤 2: 转换为图片
+  ↓ flowchart-to-excalidraw.js → .excalidraw
+  ↓ excalidraw-screenshot.js → .png
+  ↓ extract-elements.js → .elements.txt
+步骤 3: 视觉评价
+  ↓ 通过 subagent 调用 excalidraw-reviewer 读取 .png + .elements.txt → 给出精确调整建议 → 写入 /tmp/xxx-review.md
+步骤 4: 父 agent 读取评价 → 自己编辑调整 /tmp 下的 .md 文件中的 JSON
+  ↓ 可重复步骤 2-4 直到评分 ≥ 80 或达到 3 轮
+步骤 5: 展示效果图给用户 → 用户确认满意
+步骤 6: 用户满意 → 从 /tmp 复制到用户目标路径（Obsidian 仓库等）
+```
+
+### 步骤 1: 生成初始图表
+
+通过 subagent 使用 `delegate` agent + `mimo-v2.5` 模型生成初始 Excalidraw JSON。
+
+在 task 中传入完整的需求描述，并**粘贴下方对应章节的全部内容**（Design Rules、Color Palette、JSON Structure、Element Template、Output Formats、Common Mistakes）。
+
+**判断是否需要评价：**
+- 用户只要求**生成图表** → 生成后直接保存到目标路径，不走评价流程
+- 用户要求**评价/优化排版/布局/样式** → 生成后保存到 /tmp，继续步骤 2-5
+
+**调用方式：**
+```
+subagent({
+  agent: "delegate",
+  model: "mimo-v2.5",
+  task: "生成 Excalidraw 图表。\n\n用户请求：[具体内容]\n\n输出模式：[Obsidian / Standard / Animated]\n图表类型：[流程图 / 思维导图 / 层级图 / 关系图 等]\n\n请严格按照以下规范执行...\n[粘贴完整规范]\n\n生成完成后用 write 工具保存到：[需要评价 → /tmp，不需要评价 → 目标路径]\n文件名：[主题].[类型].[扩展名]"
+})
+```
+
+> ⚠️ **需要评价时必须保存到 /tmp**，不要直接写入 Obsidian 仓库。不需要评价时直接保存到用户目标路径。
+
+### 步骤 2: 转换为图片
+
+父 agent 直接用 bash 执行脚本：
+
+```bash
+# .md → .excalidraw
+node "{SKILL_DIR}/flowchart-to-excalidraw.js" "<input.md>" "<output.excalidraw>"
+
+# .excalidraw → .png
+node "{SKILL_DIR}/excalidraw-screenshot.js" "<input.excalidraw>" "<output.png>"
+
+# .excalidraw → 精简摘要「仅保留 id/type/坐标/字号/颜色/文本」
+node "{SKILL_DIR}/extract-elements.js" "<output.excalidraw>" "<output.elements.txt>"
+```
+
+- .png 和 .elements.txt 默认输出到 `/tmp/` 目录
+- 对于 Standard / Animated 模式（已经是 .excalidraw），跳过第一步
+- extract-elements.js 将 60KB+ JSON 压缩到 ~6KB 文本摘要，节省 reviewer token
+
+### 步骤 3: 视觉评价
+
+通过 subagent 调用 `excalidraw-reviewer` agent，传入 **PNG 截图**和 **元素摘要文件**（.elements.txt）。reviewer 结合视觉和数据给出精确的调整建议。
+
+> ⚠️ **父 agent 不要自己读取图片**，直接把路径传给 subagent，避免浪费 token。
+> ⚠️ **不要传完整 .excalidraw JSON**，用 extract-elements.js 提取的 .elements.txt 摘要代替，节省 token。
+
+**调用方式：**
+```
+subagent({
+  agent: "excalidraw-reviewer",
+  task: "读取以下 Excalidraw 图表并给出视觉评价。\n\n截图路径：<output.png>\n元素摘要路径：<output.elements.txt>\n\n请先用 read 读取截图（看视觉效果），再用 read 读取 .elements.txt 摘要（分析元素数据）。\n结合两者给出评价报告，每个问题必须包含具体的元素 id、当前属性值和建议修改值。\n评价完成后，用 write 工具将报告保存到：<review-path，如 /tmp/excalidraw-review-{主题}.md>"
+})
+```
+
+### 步骤 4: 父 agent 编辑调整
+
+父 agent 读取 /tmp 下的评价报告，自己动手编辑 .md 文件中的 Excalidraw JSON。
+
+**为什么不让 subagent 编辑**：excalidraw-reviewer 擅长的是理解图片、发现问题，不代表它擅长生成/编辑 JSON。编辑工作由父 agent 自己完成更可靠。
+
+**操作步骤：**
+1. 用 `read` 读取评价报告 `/tmp/excalidraw-review-{主题}.md`
+2. 分析 Critical / Warning 问题
+3. 用 `read` 读取原始 .md 文件
+4. 用 `edit` 工具直接修改 JSON 中有问题的元素（坐标、字号、颜色等）
+5. 用 `write` 保存修改
+6. 重复步骤 2-3（重新转图 + 评价）验证改进效果
+
+**迭代终止条件：**
+- 总分 ≥ 80，且无 Critical 问题 → 通过
+- 或已迭代 3 轮 → 强制通过
+
+### 步骤 5: 展示给用户确认
+
+迭代结束后，**必须**让用户看到效果图。用 `file://` 路径展示，不浪费 token 读图。
+
+**操作：**
+1. 用 bash 打开图片让用户直接查看：
+   ```bash
+   # Windows: 用默认图片查看器打开
+   start "" "<output.png>"
+   # macOS: open "<output.png>"
+   # Linux: xdg-open "<output.png>"
+   ```
+2. 在对话中输出文件路径，用户也可以手动打开：
+   ```
+   file:///C:/Users/.../xxx.png
+   ```
+3. 告知用户当前评分和主要改进情况
+4. 用 `ask_user_question` 让用户选择：
+   - **满意，保存** → 进入步骤 6 写入目标路径
+   - **继续调整** → 用户说明调整需求 → 回到步骤 4 修改 → 重新转图展示
+   - **不满意，放弃** → 不写入，告知用户结果保存在 /tmp 下可手动查看
+
+### 步骤 6: 保存最终版本
+
+用户确认满意后，从 /tmp 复制到目标路径。
+
+```bash
+# 从 /tmp 复制到目标路径
+cp "/tmp/[主题].[类型].md" "<用户目标路径>"
+```
+
+如果用户始终不满意但已迭代 3 轮，告知用户工作副本在 /tmp 下，可手动查看和决定。
+
+### 对已有 .flowchart.md 的优化流程
+
+当用户提供已有的 .flowchart.md 文件要求优化时：
+
+1. 先将原文件复制到 /tmp 作为工作副本（不在原文件上直接修改）
+2. 直接从步骤 2 开始（已有文件跳过生成步骤）
+3. 进入评价 → 编辑调整循环（全程在 /tmp 下操作）
+4. 编辑调整由父 agent 自己完成（步骤 4）
+5. 展示效果图给用户确认（步骤 5）
+6. 用户满意后，将 /tmp 下的工作副本写回原路径（步骤 6）
+
+---
 
 ## Output Modes
 
@@ -18,16 +174,6 @@ Create Excalidraw diagrams from text content with multiple output formats.
 | `Excalidraw`、`画图`、`流程图`、`思维导图` | **Obsidian**（默认） | `.md` | 在 Obsidian 中直接打开 |
 | `标准Excalidraw`、`standard excalidraw` | **Standard** | `.excalidraw` | 在 excalidraw.com 打开/编辑/分享 |
 | `Excalidraw动画`、`动画图`、`animate` | **Animated** | `.excalidraw` | 拖到 excalidraw-animate 生成动画 |
-
-## Workflow
-
-1. **Detect output mode** from trigger words (see Output Modes table above)
-2. Analyze content - identify concepts, relationships, hierarchy
-3. Choose diagram type (see Diagram Types below)
-4. Generate Excalidraw JSON (add animation order if Animated mode)
-5. Output in correct format based on mode
-6. **Automatically save to current working directory**
-7. Notify user with file path and usage instructions
 
 ## Output Formats
 
@@ -53,113 +199,69 @@ tags: [excalidraw]
 %%
 ```
 
-**关键要点：**
-- Frontmatter 必须包含 `tags: [excalidraw]`
-- 警告信息必须完整
-- JSON 必须被 `%%` 标记包围
-- 不能使用 `excalidraw-plugin: parsed` 以外的其他 frontmatter 设置
-- **文件扩展名**：`.md`
+- Frontmatter 必须包含 `tags: [excalidraw]`，不能使用其他 frontmatter 设置
+- `## Text Elements` 部分**必须留空**，插件会根据 JSON 自动填充
 
 ### Mode 2: Standard Excalidraw Format
 
-直接输出纯 JSON 文件，可在 excalidraw.com 打开：
-
-```json
-{
-  "type": "excalidraw",
-  "version": 2,
-  "source": "https://excalidraw.com",
-  "elements": [...],
-  "appState": {
-    "gridSize": null,
-    "viewBackgroundColor": "#ffffff"
-  },
-  "files": {}
-}
-```
-
-**关键要点：**
-- `source` 使用 `https://excalidraw.com`（不是 Obsidian 插件）
-- 纯 JSON，无 Markdown 包装
-- **文件扩展名**：`.excalidraw`
+纯 JSON 文件，可在 excalidraw.com 打开。`source` 使用 `https://excalidraw.com`。
 
 ### Mode 3: Animated Excalidraw Format
 
-与 Standard 格式相同，但每个元素添加 `customData.animate` 字段控制动画顺序：
+与 Standard 相同，每个元素添加 `customData.animate` 字段：
 
 ```json
-{
-  "id": "element-1",
-  "type": "rectangle",
-  "customData": {
-    "animate": {
-      "order": 1,
-      "duration": 500
-    }
-  },
-  ...其他标准字段
-}
+"customData": { "animate": { "order": 1, "duration": 500 } }
 ```
 
-**动画顺序规则：**
-- `order`: 动画播放顺序（1, 2, 3...），数字越小越先出现
-- `duration`: 该元素的绘制时长（毫秒），默认 500
-- 相同 `order` 的元素同时出现
+- `order`: 播放顺序（1, 2, 3...），越小越先出现，相同 order 同时出现
+- `duration`: 绘制时长（毫秒），默认 500
 - 建议顺序：标题 → 主要框架 → 连接线 → 细节文字
-
-**使用方法：**
-1. 生成 `.excalidraw` 文件
-2. 拖到 https://dai-shi.github.io/excalidraw-animate/
-3. 点击 Animate 预览，然后导出 SVG 或 WebM
-
-**文件扩展名**：`.excalidraw`
 
 ---
 
 ## Diagram Types & Selection Guide
 
-选择合适的图表形式，以提升理解力与视觉吸引力。
-
 | 类型 | 英文 | 使用场景 | 做法 |
 |------|------|---------|------|
-| **流程图** | Flowchart | 步骤说明、工作流程、任务执行顺序 | 用箭头连接各步骤，清晰表达流程走向 |
-| **思维导图** | Mind Map | 概念发散、主题分类、灵感捕捉 | 以中心为核心向外发散，放射状结构 |
-| **层级图** | Hierarchy | 组织结构、内容分级、系统拆解 | 自上而下或自左至右构建层级节点 |
-| **关系图** | Relationship | 要素之间的影响、依赖、互动 | 图形间用连线表示关联，箭头与说明 |
-| **对比图** | Comparison | 两种以上方案或观点的对照分析 | 左右两栏或表格形式，标明比较维度 |
-| **时间线图** | Timeline | 事件发展、项目进度、模型演化 | 以时间为轴，标出关键时间点与事件 |
-| **矩阵图** | Matrix | 双维度分类、任务优先级、定位 | 建立 X 与 Y 两个维度，坐标平面安置 |
-| **自由布局** | Freeform | 内容零散、灵感记录、初步信息收集 | 无需结构限制，自由放置图块与箭头 |
+| **流程图** | Flowchart | 步骤说明、工作流程、任务执行顺序 | 用箭头连接各步骤 |
+| **思维导图** | Mind Map | 概念发散、主题分类、灵感捕捉 | 中心向外放射状结构 |
+| **层级图** | Hierarchy | 组织结构、内容分级、系统拆解 | 自上而下或自左至右 |
+| **关系图** | Relationship | 要素之间的影响、依赖、互动 | 图形间用连线表示关联 |
+| **对比图** | Comparison | 两种以上方案或观点的对照分析 | 左右两栏或表格形式 |
+| **时间线图** | Timeline | 事件发展、项目进度、模型演化 | 以时间为轴标注关键点 |
+| **矩阵图** | Matrix | 双维度分类、任务优先级、定位 | X/Y 坐标平面安置 |
+| **自由布局** | Freeform | 内容零散、灵感记录、初步信息收集 | 自由放置图块与箭头 |
+
+---
 
 ## Design Rules
 
 ### Text & Format
 - **所有文本元素必须使用** `fontFamily: 5`（Excalifont 手写字体）
-- **文本中的双引号替换规则**：`"` 替换为 `『』`
-- **文本中的圆括号替换规则**：`()` 替换为 `「」`
-- **字体大小规则**（硬性下限，低于此值在正常缩放下不可读）：
+- **双引号** `"` 替换为 `『』`，**圆括号** `()` 替换为 `「」`
+- **字体大小**（硬性下限，低于此值不可读）：
   - 标题：20-28px（最小 20px）
   - 副标题：18-20px
   - 正文/标签：16-18px（最小 16px）
-  - 次要注释：14px（仅限不重要的辅助说明，慎用）
+  - 次要注释：14px（慎用）
   - **绝对禁止低于 14px**
-- **行高**：所有文本使用 `lineHeight: 1.25`
-- **文字居中估算**：独立文本元素没有自动居中，需手动计算 x 坐标：
-  - 估算文字宽度：`estimatedWidth = text.length * fontSize * 0.5`（CJK 字符用 `* 1.0`）
+- **行高**：所有文本 `lineHeight: 1.25`
+- **文字居中估算**：独立文本元素需手动计算 x 坐标
+  - 估算宽度：`estimatedWidth = text.length * fontSize * 0.5`（CJK 字符用 `* 1.0`）
   - 居中公式：`x = centerX - estimatedWidth / 2`
-  - 示例：文字 "Hello"（5字符, fontSize 20）居中于 x=300 → `estimatedWidth = 5 * 20 * 0.5 = 50` → `x = 300 - 25 = 275`
 
 ### Layout & Design
-- **画布范围**：建议所有元素在 0-1200 x 0-800 区域内
+- **画布范围**：所有元素在 0-1200 x 0-800 区域内，四周留白 50-80px
 - **最小形状尺寸**：带文字的矩形/椭圆不小于 120x60px
-- **元素间距**：最小 20-30px 间距，防止重叠
-- **层次清晰**：使用不同颜色和形状区分不同层级的信息
-- **图形元素**：适当使用矩形框、圆形、箭头等元素来组织信息
-- **禁止 Emoji**：不要在图表文本中使用任何 Emoji 符号，如需视觉标记请使用简单图形（圆形、方形、箭头）或颜色区分
+- **元素间距**：最小 20-30px，防止重叠
+- **禁止 Emoji**：如需视觉标记请使用简单图形或颜色区分
 
-### Color Palette
+---
 
-**文字颜色（strokeColor for text）：**
+## Color Palette
+
+### 文字颜色（strokeColor）
 
 | 用途 | 色值 | 说明 |
 |------|------|------|
@@ -168,7 +270,7 @@ tags: [excalidraw]
 | 正文文字 | `#374151` | 深灰（白底最浅不低于 `#757575`） |
 | 强调/重点 | `#f59e0b` | 金色 |
 
-**形状填充色（backgroundColor, fillStyle: "solid"）：**
+### 形状填充色（backgroundColor + fillStyle: "solid"）
 
 | 色值 | 语义 | 适用场景 |
 |------|------|---------|
@@ -181,7 +283,7 @@ tags: [excalidraw]
 | `#c3fae8` | 浅青 | 存储、数据、缓存 |
 | `#eebefa` | 浅粉 | 分析、指标、统计 |
 
-**区域背景色（大矩形 + opacity: 30，用于分层图表）：**
+### 区域背景色（大矩形 + opacity: 30）
 
 | 色值 | 语义 |
 |------|------|
@@ -189,12 +291,11 @@ tags: [excalidraw]
 | `#e5dbff` | 逻辑/处理层 |
 | `#d3f9d8` | 数据/工具层 |
 
-**对比度规则：**
-- 白底上文字最浅不低于 `#757575`，否则不可读
-- 浅色填充上用深色变体文字（如浅绿底用 `#15803d`，不用 `#22c55e`）
-- 避免浅灰色文字（`#b0b0b0`、`#999`）出现在白底上
+### 对比度规则
+- 白底上文字最浅不低于 `#757575`
+- 浅色填充上用深色变体文字（如浅绿底用 `#15803d`）
 
-参考：[references/excalidraw-schema.md](references/excalidraw-schema.md)
+---
 
 ## JSON Structure
 
@@ -222,14 +323,17 @@ tags: [excalidraw]
 }
 ```
 
+---
+
 ## Element Template
 
-Each element requires these fields (do NOT add extra fields like `frameId`, `index`, `versionNonce`, `rawText` -- they may cause issues on excalidraw.com. `boundElements` must be `null` not `[]`, `updated` must be `1` not timestamps):
+**IMPORTANT**: 禁止包含 `frameId`、`index`、`versionNonce`、`rawText` 字段。`boundElements` 必须为 `null`（不是 `[]`），`updated` 必须为 `1`（不是时间戳）。
 
+### 通用元素
 ```json
 {
   "id": "unique-id",
-  "type": "rectangle",
+  "type": "rectangle|text|arrow|ellipse|diamond",
   "x": 100, "y": 100,
   "width": 200, "height": 50,
   "angle": 0,
@@ -252,9 +356,9 @@ Each element requires these fields (do NOT add extra fields like `frameId`, `ind
 }
 ```
 
-`strokeStyle` values: `"solid"`（实线，默认）| `"dashed"`（虚线）| `"dotted"`（点线）。虚线适合表示可选路径、异步流、弱关联等。
+`strokeStyle`: `"solid"`（实线）| `"dashed"`（虚线）| `"dotted"`（点线）
 
-Text elements add:
+### 文本元素额外字段
 ```json
 {
   "text": "显示文本",
@@ -269,119 +373,26 @@ Text elements add:
 }
 ```
 
-**Animated 模式额外添加** `customData` 字段：
+### Animated 模式额外字段
 ```json
-{
-  "id": "title-1",
-  "type": "text",
-  "customData": {
-    "animate": {
-      "order": 1,
-      "duration": 500
-    }
-  },
-  ...其他字段
-}
+"customData": { "animate": { "order": 1, "duration": 500 } }
 ```
-
-See [references/excalidraw-schema.md](references/excalidraw-schema.md) for all element types.
 
 ---
 
-## Additional Technical Requirements
-
-### Text Elements 处理
-- `## Text Elements` 部分在 Markdown 中**必须留空**，仅用 `%%` 作为分隔符
-- Obsidian ExcaliDraw 插件会根据 JSON 数据**自动填充文本元素**
-- 不需要手动列出所有文本内容
-
-### 坐标与布局
-- **坐标系统**：左上角为原点 (0,0)
-- **推荐范围**：所有元素在 0-1200 x 0-800 像素范围内
-- **元素 ID**：每个元素需要唯一的 `id`（可以是字符串，如「title」「box1」等）
-
-### Required Fields for All Elements
-
-**IMPORTANT**: Do NOT include `frameId`, `index`, `versionNonce`, or `rawText` fields. Use `boundElements: null` (not `[]`), and `updated: 1` (not timestamps).
-
-```json
-{
-  "id": "unique-identifier",
-  "type": "rectangle|text|arrow|ellipse|diamond",
-  "x": 100, "y": 100,
-  "width": 200, "height": 50,
-  "angle": 0,
-  "strokeColor": "#color-hex",
-  "backgroundColor": "transparent|#color-hex",
-  "fillStyle": "solid",
-  "strokeWidth": 2,
-  "strokeStyle": "solid|dashed|dotted",
-  "roughness": 1,
-  "opacity": 100,
-  "groupIds": [],
-  "roundness": {"type": 3},
-  "seed": 123456789,
-  "version": 1,
-  "isDeleted": false,
-  "boundElements": null,
-  "updated": 1,
-  "link": null,
-  "locked": false
-}
-```
-
-### Text-Specific Properties
-文本元素 (type: "text") 需要额外属性（do NOT include `rawText`）：
-```json
-{
-  "text": "显示文本",
-  "fontSize": 20,
-  "fontFamily": 5,
-  "textAlign": "center",
-  "verticalAlign": "middle",
-  "containerId": null,
-  "originalText": "显示文本",
-  "autoResize": true,
-  "lineHeight": 1.25
-}
-```
-
-### appState 配置
-```json
-"appState": {
-  "gridSize": null,
-  "viewBackgroundColor": "#ffffff"
-}
-```
-
-### files 字段
-```json
-"files": {}
-```
-
 ## Common Mistakes to Avoid
 
-- **文字偏移** — 独立 text 元素的 `x` 是左边缘，不是中心。必须用居中公式手动计算，否则文字会偏到一边
-- **元素重叠** — y 坐标相近的元素容易堆叠。放置新元素前检查与周围元素是否有至少 20px 间距
-- **画布留白不足** — 内容不要贴着画布边缘。在四周留 50-80px 的 padding
+- **文字偏移** — 独立 text 元素的 `x` 是左边缘，不是中心。必须用居中公式手动计算
+- **元素重叠** — 放置新元素前检查与周围元素是否有至少 20px 间距
+- **画布留白不足** — 内容不要贴着画布边缘，四周留 50-80px padding
 - **标题没有居中于图表** — 标题应居中于下方图表的整体宽度，不是固定在 x=0
-- **箭头标签溢出** — 长文字标签（如 "ATP + NADPH"）会超出短箭头。保持标签简短或加大箭头长度
-- **对比度不够** — 浅色文字在白底上几乎不可见。文字颜色不低于 `#757575`，有色文字用深色变体
-- **字号太小** — 低于 14px 在正常缩放下不可读，正文最小 16px
+- **箭头标签溢出** — 长文字标签会超出短箭头，保持标签简短或加大箭头长度
+- **对比度不够** — 浅色文字在白底上几乎不可见，不低于 `#757575`
+- **字号太小** — 低于 14px 不可读，正文最小 16px
 
-## Implementation Notes
+---
 
-### Auto-save & File Generation Workflow
-
-当生成 Excalidraw 图表时，**必须自动执行以下步骤**：
-
-#### 1. 选择合适的图表类型
-- 根据用户提供的内容特性，参考上方 「Diagram Types & Selection Guide」 表
-- 分析内容的核心诉求，选择最合适的可视化形式
-
-#### 2. 生成有意义的文件名
-
-根据输出模式选择文件扩展名：
+## Auto-save & File Naming
 
 | 模式 | 文件名格式 | 示例 |
 |------|-----------|------|
@@ -389,88 +400,37 @@ See [references/excalidraw-schema.md](references/excalidraw-schema.md) for all e
 | Standard | `[主题].[类型].excalidraw` | `商业模式.relationship.excalidraw` |
 | Animated | `[主题].[类型].animate.excalidraw` | `商业模式.relationship.animate.excalidraw` |
 
-- 优先使用中文以提高清晰度
+- 保存位置：当前工作目录
+- 优先使用中文文件名
 
-#### 3. 使用 Write 工具自动保存文件
-- **保存位置**：当前工作目录（自动检测环境变量）
-- **完整路径**：`{current_directory}/[filename].md`
-- 这样可以实现灵活迁移，无需硬编码路径
+## Tool Scripts
 
-#### 4. 确保 Markdown 结构完全正确
-**必须按以下格式生成**（不能有任何修改）：
+本目录还包含三个辅助脚本：
 
-```markdown
----
-excalidraw-plugin: parsed
-tags: [excalidraw]
----
-==⚠  Switch to EXCALIDRAW VIEW in the MORE OPTIONS menu of this document. ⚠== You can decompress Drawing data with the command palette: 'Decompress current Excalidraw file'. For more info check in plugin settings under 'Saving'
+### flowchart-to-excalidraw.js
+将 Obsidian Excalidraw 插件的 `.flowchart.md` 文件转换为标准 `.excalidraw` 文件。
 
-# Excalidraw Data
-
-## Text Elements
-%%
-## Drawing
-\`\`\`json
-{完整的 JSON 数据}
-\`\`\`
-%%
+```bash
+node flowchart-to-excalidraw.js <input.flowchart.md> [output.excalidraw]
 ```
 
-#### 5. JSON 数据要求
-- 包含完整的 Excalidraw JSON 结构
-- 所有文本元素使用 `fontFamily: 5`
-- 文本中的 `"` 替换为 `『』`
-- 文本中的 `()` 替换为 `「」`
-- JSON 格式必须有效，通过语法检查
-- 所有元素有唯一的 `id`
-- 包含 `appState` 和 `files: {}` 字段
+### excalidraw-screenshot.js
+将 `.excalidraw` 文件渲染为 PNG 截图（使用系统 msedge 浏览器）。
 
-#### 6. 用户反馈与确认
-向用户报告：
-- 图表已生成
-- 精确的保存位置
-- 如何在 Obsidian 中查看
-- 图表的设计选择说明（选择了什么类型的图表、为什么）
-- 是否需要调整或修改
-
-### Example Output Messages
-
-**Obsidian 模式：**
-```
-Excalidraw 图已生成！
-
-保存位置：商业模式.relationship.md
-
-使用方法：
-1. 在 Obsidian 中打开此文件
-2. 点击右上角 MORE OPTIONS 菜单
-3. 选择 Switch to EXCALIDRAW VIEW
+```bash
+node excalidraw-screenshot.js <input.excalidraw> [output.png]
 ```
 
-**Standard 模式：**
-```
-Excalidraw 图已生成！
+- 默认输出到 `/tmp/` 目录
+- 支持中文渲染，自动计算 viewBox
 
-保存位置：商业模式.relationship.excalidraw
+### extract-elements.js
+将 `.excalidraw` JSON 文件提取为精简的元素摘要文本（60KB+ → ~6KB）。
 
-使用方法：
-1. 打开 https://excalidraw.com
-2. 点击左上角菜单 → Open → 选择此文件
-3. 或直接拖拽文件到 excalidraw.com 页面
+```bash
+node extract-elements.js <input.excalidraw> [output.txt]
 ```
 
-**Animated 模式：**
-```
-Excalidraw 动画图已生成！
-
-保存位置：商业模式.relationship.animate.excalidraw
-
-动画顺序：标题(1) → 主框架(2-4) → 连接线(5-7) → 说明文字(8-10)
-
-生成动画：
-1. 打开 https://dai-shi.github.io/excalidraw-animate/
-2. 点击 Load File 选择此文件
-3. 预览动画效果
-4. 点击 Export 导出 SVG 或 WebM
-```
+- 默认输出到同目录下 `<filename>.elements.txt`
+- 每个元素只保留：id、type、坐标、尺寸、字号、颜色、文本内容
+- 用于传给 excalidraw-reviewer subagent，节省 token

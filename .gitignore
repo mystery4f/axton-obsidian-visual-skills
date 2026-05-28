@@ -22,3 +22,6 @@ DEVLOG.md
 
 # Project rules (private)
 CLAUDE.md
+
+# Dependencies
+node_modules/
