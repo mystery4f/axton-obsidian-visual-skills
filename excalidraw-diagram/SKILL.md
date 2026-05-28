@@ -34,31 +34,50 @@ SKILL_DIR = excalidraw-diagram skill 所在目录
 
 进入评价流程时，先创建带时间戳的工作目录，所有中间文件统一放这里。**一次 skill 调用只创建一次，后续所有步骤共用同一目录**。
 
+每轮迭代使用版本子目录 `v1/`、`v2/`、`v3/`，保留历史版本便于对比回溯。
+
 ```bash
 # 步骤 0：创建一次，后续复用
 WORK_DIR="/tmp/excalidraw-$(date +%Y%m%d-%H%M%S)"
 mkdir -p "$WORK_DIR"
 echo "$WORK_DIR"  # 记住这个路径，后续步骤都用它
+
+# 每轮迭代时
+ROUND=1
+VERSION_DIR="$WORK_DIR/v$ROUND"
+mkdir -p "$VERSION_DIR"
 ```
 
-后续所有路径均基于 `$WORK_DIR`，例如：
-- `{主题}.md` — 工作副本
-- `{主题}.excalidraw` — 转换中间文件
-- `{主题}.png` — 截图
-- `{主题}.elements.txt` — 元素摘要
-- `review.md` — 评价报告
+目录结构示例：
+```
+/tmp/excalidraw-20260529-143000/
+├── v1/
+│   ├── {主题}.md
+│   ├── {主题}.excalidraw
+│   ├── {主题}.png
+│   ├── {主题}.elements.txt
+│   └── review.md
+├── v2/
+│   ├── {主题}.md
+│   ├── {主题}.excalidraw
+│   ├── {主题}.png
+│   ├── {主题}.elements.txt
+│   └── review.md
+└── v3/  (如需)
+    └── ...
+```
 
 ### 完整流程
 
 ```
-步骤 0: mkdir -p /tmp/excalidraw-{时间戳}
-步骤 1: 生成初始图表 → 保存到 $WORK_DIR
-步骤 2: 转换为图片 → $WORK_DIR/{主题}.excalidraw / .png / .elements.txt
-步骤 3: 视觉评价 → $WORK_DIR/review.md
-步骤 4: 父 agent 读取评价 → 自己编辑调整 $WORK_DIR 下的 .md
-  ↓ 可重复步骤 2-4 直到评分 ≥ 80 或达到 3 轮
-步骤 5: 展示效果图给用户 → 用户确认满意
-步骤 6: 用户满意 → 从 $WORK_DIR 复制到用户目标路径
+步骤 0: mkdir -p $WORK_DIR
+步骤 1: 生成初始图表 → 保存到 $WORK_DIR/v1/
+步骤 2: 转换为图片 → $WORK_DIR/v1/{主题}.excalidraw / .png / .elements.txt
+步骤 3: 视觉评价 → $WORK_DIR/v1/review.md
+步骤 4: 父 agent 读取评价 → 编辑后保存到 $WORK_DIR/v2/{主题}.md
+  ↓ 重复步骤 2-4，版本号递增（v2, v3...）
+步骤 5: 展示最新版本效果图给用户 → 用户确认满意
+步骤 6: 用户满意 → 从 $WORK_DIR/v{N}/ 复制到用户目标路径
 ```
 
 ### 步骤 1: 生成初始图表
@@ -69,18 +88,18 @@ echo "$WORK_DIR"  # 记住这个路径，后续步骤都用它
 
 **判断是否需要评价：**
 - 用户只要求**生成图表** → 生成后直接保存到目标路径，不走评价流程
-- 用户要求**评价/优化排版/布局/样式** → 先创建 `$WORK_DIR`，生成后保存到 `$WORK_DIR`，继续步骤 2-5
+- 用户要求**评价/优化排版/布局/样式** → 先创建 `$WORK_DIR` 和 `$WORK_DIR/v1`，生成后保存到 `$WORK_DIR/v1`，继续步骤 2-5
 
 **调用方式：**
 ```
 subagent({
   agent: "delegate",
   model: "mimo-v2.5",
-  task: "生成 Excalidraw 图表。\n\n用户请求：[具体内容]\n\n输出模式：[Obsidian / Standard / Animated]\n图表类型：[流程图 / 思维导图 / 层级图 / 关系图 等]\n\n请严格按照以下规范执行...\n[粘贴完整规范]\n\n生成完成后用 write 工具保存到：[需要评价 → $WORK_DIR，不需要评价 → 目标路径]\n文件名：[主题].[类型].[扩展名]"
+  task: "生成 Excalidraw 图表。\n\n用户请求：[具体内容]\n\n输出模式：[Obsidian / Standard / Animated]\n图表类型：[流程图 / 思维导图 / 层级图 / 关系图 等]\n\n请严格按照以下规范执行...\n[粘贴完整规范]\n\n生成完成后用 write 工具保存到：[需要评价 → $WORK_DIR/v1，不需要评价 → 目标路径]\n文件名：[主题].[类型].[扩展名]"
 })
 ```
 
-> ⚠️ **需要评价时必须保存到 $WORK_DIR**，不要直接写入 Obsidian 仓库。不需要评价时直接保存到用户目标路径。
+> ⚠️ **需要评价时必须保存到 $WORK_DIR/v1**，不要直接写入 Obsidian 仓库。不需要评价时直接保存到用户目标路径。
 
 ### 步骤 2: 转换为图片
 
@@ -97,7 +116,7 @@ node "{SKILL_DIR}/excalidraw-screenshot.js" "<input.excalidraw>" "<output.png>"
 node "{SKILL_DIR}/extract-elements.js" "<output.excalidraw>" "<output.elements.txt>"
 ```
 
-- 所有输出文件统一到 `$WORK_DIR`
+- 所有输出文件统一到 `$WORK_DIR/v{N}`（N 为当前迭代轮次）
 - 对于 Standard / Animated 模式（已经是 .excalidraw），跳过第一步
 - extract-elements.js 将 60KB+ JSON 压缩到 ~6KB 文本摘要，节省 reviewer token
 
@@ -112,23 +131,23 @@ node "{SKILL_DIR}/extract-elements.js" "<output.excalidraw>" "<output.elements.t
 ```
 subagent({
   agent: "excalidraw-reviewer",
-  task: "读取以下 Excalidraw 图表并给出视觉评价。\n\n截图路径：<output.png>\n元素摘要路径：<output.elements.txt>\n\n请先用 read 读取截图（看视觉效果），再用 read 读取 .elements.txt 摘要（分析元素数据）。\n结合两者给出评价报告，每个问题必须包含具体的元素 id、当前属性值和建议修改值。\n评价完成后，用 write 工具将报告保存到：$WORK_DIR/review.md'"
+  task: "读取以下 Excalidraw 图表并给出视觉评价。\n\n截图路径：<output.png>\n元素摘要路径：<output.elements.txt>\n\n请先用 read 读取截图（看视觉效果），再用 read 读取 .elements.txt 摘要（分析元素数据）。\n结合两者给出评价报告，每个问题必须包含具体的元素 id、当前属性值和建议修改值。\n评价完成后，用 write 工具将报告保存到：$WORK_DIR/v{N}/review.md'"
 })
 ```
 
 ### 步骤 4: 父 agent 编辑调整
 
-父 agent 读取 `$WORK_DIR/review.md` 评价报告，自己动手编辑 `$WORK_DIR` 下的 .md 文件中的 Excalidraw JSON。
+父 agent 读取 `$WORK_DIR/v{N}/review.md` 评价报告，自己动手编辑后保存到 `$WORK_DIR/v{N+1}/{主题}.md`。
 
 **为什么不让 subagent 编辑**：excalidraw-reviewer 擅长的是理解图片、发现问题，不代表它擅长生成/编辑 JSON。编辑工作由父 agent 自己完成更可靠。
 
 **操作步骤：**
-1. 用 `read` 读取评价报告 `$WORK_DIR/review.md`
+1. 用 `read` 读取评价报告 `$WORK_DIR/v{N}/review.md`
 2. 分析 Critical / Warning 问题
-3. 用 `read` 读取原始 .md 文件
+3. 用 `read` 读取上一轮 `$WORK_DIR/v{N}/{主题}.md`
 4. 用 `edit` 工具直接修改 JSON 中有问题的元素（坐标、字号、颜色等）
-5. 用 `write` 保存修改
-6. 重复步骤 2-3（重新转图 + 评价）验证改进效果
+5. 创建 `$WORK_DIR/v{N+1}/` 目录，用 `write` 保存修改后的文件
+6. 重复步骤 2-3（在新版本目录下重新转图 + 评价）验证改进效果
 
 **迭代终止条件：**
 - 总分 ≥ 80，且无 Critical 问题 → 通过
@@ -142,13 +161,13 @@ subagent({
 1. 用 bash 打开图片让用户直接查看：
    ```bash
    # Windows: 用默认图片查看器打开
-   start "" "$WORK_DIR/{主题}.png"
-   # macOS: open "$WORK_DIR/{主题}.png"
-   # Linux: xdg-open "$WORK_DIR/{主题}.png"
+   start "" "$WORK_DIR/v{N}/{主题}.png"
+   # macOS: open "$WORK_DIR/v{N}/{主题}.png"
+   # Linux: xdg-open "$WORK_DIR/v{N}/{主题}.png"
    ```
 2. 在对话中输出文件路径，用户也可以手动打开：
    ```
-   file://$WORK_DIR/{主题}.png
+   file://$WORK_DIR/v{N}/{主题}.png
    ```
 3. 告知用户当前评分和主要改进情况
 4. 用 `ask_user_question` 让用户选择：
@@ -161,23 +180,23 @@ subagent({
 用户确认满意后，从 /tmp 复制到目标路径。
 
 ```bash
-# 从 $WORK_DIR 复制到目标路径
-cp "$WORK_DIR/[主题].[类型].md" "<用户目标路径>"
+# 从 $WORK_DIR/v{N} 复制到目标路径
+cp "$WORK_DIR/v{N}/[主题].[类型].md" "<用户目标路径>"
 ```
 
-如果用户始终不满意但已迭代 3 轮，告知用户工作副本在 $WORK_DIR 下，可手动查看和决定。
+如果用户始终不满意但已迭代 3 轮，告知用户所有版本在 $WORK_DIR 下，可手动查看和选择。
 
 ### 对已有 .flowchart.md 的优化流程
 
 当用户提供已有的 .flowchart.md 文件要求优化时：
 
-1. 先创建工作目录 `mkdir -p /tmp/excalidraw-{timestamp}`
-2. 将原文件复制到 $WORK_DIR 作为工作副本（不在原文件上直接修改）
+1. 先创建工作目录 `mkdir -p /tmp/excalidraw-{timestamp}` 和 `v1/`
+2. 将原文件复制到 `$WORK_DIR/v1/` 作为工作副本（不在原文件上直接修改）
 3. 直接从步骤 2 开始（已有文件跳过生成步骤）
-4. 进入评价 → 编辑调整循环（全程在 $WORK_DIR 下操作）
+4. 进入评价 → 编辑调整循环，每轮迭代版本号递增（v1, v2, v3）
 5. 编辑调整由父 agent 自己完成（步骤 4）
-6. 展示效果图给用户确认（步骤 5）
-7. 用户满意后，将 $WORK_DIR 下的工作副本写回原路径（步骤 6）
+6. 展示最新版本效果图给用户确认（步骤 5）
+7. 用户满意后，将 $WORK_DIR/v{N}/ 下的工作副本写回原路径（步骤 6）
 
 ---
 
